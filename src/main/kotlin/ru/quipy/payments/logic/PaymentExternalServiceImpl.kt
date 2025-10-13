@@ -2,25 +2,23 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.ratelimiter.RateLimiter
+import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Metrics
-import io.micrometer.core.instrument.Timer
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
-import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.core.EventSourcingService
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
-
-// Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -30,7 +28,6 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
     }
@@ -39,27 +36,27 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+    private val processingTime = properties.averageProcessingTime
 
     private val client = OkHttpClient.Builder().build()
 
-    private val rateLimiter = SlidingWindowRateLimiter(
-        rate = rateLimitPerSec.toLong(),
-        window = Duration.ofSeconds(1)
-    )
+    private val resilience4jRateLimiter: RateLimiter
+    private val semaphore = Semaphore(parallelRequests, true)
 
-    private val semaphore = Semaphore(parallelRequests)
-
-    // Используем глобальный MeterRegistry
     private val meterRegistry: MeterRegistry = Metrics.globalRegistry
-
-    // Метрики
     private val semaphoreRequestsCounter: Counter
     private val semaphoreAcquiredCounter: Counter
     private val semaphoreTimeoutCounter: Counter
-    private val semaphoreWaitTimer: Timer
 
     init {
-        // Инициализация метрик с тегами для лучшей идентификации
+        val rateLimiterConfig = RateLimiterConfig.custom()
+            .limitForPeriod(rateLimitPerSec)
+            .limitRefreshPeriod(Duration.ofSeconds(1))
+            .timeoutDuration(Duration.ZERO) // не блокируем acquirePermission
+            .build()
+
+        resilience4jRateLimiter = RateLimiter.of("rateLimiter-$accountName", rateLimiterConfig)
+
         semaphoreRequestsCounter = Counter.builder("payment.semaphore.requests.total")
             .description("Total number of requests to the semaphore")
             .tag("account", accountName)
@@ -78,38 +75,32 @@ class PaymentExternalSystemAdapterImpl(
             .tag("service", serviceName)
             .register(meterRegistry)
 
-        semaphoreWaitTimer = Timer.builder("payment.semaphore.wait.duration")
-            .description("Time spent waiting for semaphore acquisition")
-            .tag("account", accountName)
-            .tag("service", serviceName)
-            .register(meterRegistry)
-
-        // Метрика для текущего состояния семафора (доступные разрешения)
-        meterRegistry.gauge("payment.semaphore.available.permits",
+        meterRegistry.gauge(
+            "payment.semaphore.available.permits",
             listOf(
                 io.micrometer.core.instrument.Tag.of("account", accountName),
                 io.micrometer.core.instrument.Tag.of("service", serviceName)
             ),
             semaphore
-        ) { obj -> obj.availablePermits().toDouble() }
+        ) { it.availablePermits().toDouble() }
 
-        // Метрика для максимального количества разрешений
-        meterRegistry.gauge("payment.semaphore.max.permits",
+        meterRegistry.gauge(
+            "payment.semaphore.max.permits",
             listOf(
                 io.micrometer.core.instrument.Tag.of("account", accountName),
                 io.micrometer.core.instrument.Tag.of("service", serviceName)
             ),
             semaphore
-        ) { obj -> parallelRequests.toDouble() }
+        ) { parallelRequests.toDouble() }
 
-        // Метрика для длины очереди (сколько потоков ждут)
-        meterRegistry.gauge("payment.semaphore.queue.length",
+        meterRegistry.gauge(
+            "payment.semaphore.queue.length",
             listOf(
                 io.micrometer.core.instrument.Tag.of("account", accountName),
                 io.micrometer.core.instrument.Tag.of("service", serviceName)
             ),
             semaphore
-        ) { obj -> obj.queueLength.toDouble() }
+        ) { it.queueLength.toDouble() }
 
         logger.info("Metrics initialized for account: $accountName, service: $serviceName")
     }
@@ -118,15 +109,21 @@ class PaymentExternalSystemAdapterImpl(
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
-        val remainingTime = (deadline - now()) / 2
+        val remainingTime = deadline - now()
 
-        // Увеличиваем счетчик запросов к семафору
+        if (remainingTime <= 0) {
+            logger.warn("[$accountName] Rejecting payment $paymentId: deadline already passed")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline already passed")
+            }
+            return
+        }
+
         semaphoreRequestsCounter.increment()
 
         try {
             if (!semaphore.tryAcquire(remainingTime, TimeUnit.MILLISECONDS)) {
                 logger.warn("[$accountName] Rejecting payment $paymentId: parallel requests limit reached")
-                // Увеличиваем счетчик таймаутов
                 semaphoreTimeoutCounter.increment()
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Parallel requests limit reached")
@@ -134,12 +131,39 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
-            // Увеличиваем счетчик успешных захватов семафора
             semaphoreAcquiredCounter.increment()
 
-            rateLimiter.tickBlocking()
-
             try {
+                val rateLimiterRemainingTime = deadline - now() - processingTime.toMillis() - 200
+                if (rateLimiterRemainingTime <= 0) {
+                    logger.warn("[$accountName] Rejecting payment $paymentId: deadline reached while waiting for semaphore")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Deadline reached while waiting for semaphore")
+                    }
+                    return
+                }
+
+                val nanosToWait = resilience4jRateLimiter.reservePermission()
+                if (nanosToWait < 0) {
+                    logger.warn("[$accountName] Rejecting payment $paymentId: rate limit exceeded")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Rate limit exceeded")
+                    }
+                    return
+                }
+
+                val waitMillis = TimeUnit.NANOSECONDS.toMillis(nanosToWait)
+                if (waitMillis > rateLimiterRemainingTime) {
+                    resilience4jRateLimiter.onError(RuntimeException("deadline exceeded"))
+                    logger.warn("[$accountName] Rejecting payment $paymentId: rate limit would exceed deadline")
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Rate limit would exceed deadline")
+                    }
+                    return
+                }
+
+                if (waitMillis > 0) Thread.sleep(waitMillis)
+
                 val request = Request.Builder()
                     .url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                     .post(emptyBody)
@@ -150,13 +174,10 @@ class PaymentExternalSystemAdapterImpl(
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                     } catch (e: Exception) {
                         logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     }
 
                     logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
                     paymentESService.update(paymentId) {
                         it.logProcessing(body.result, now(), transactionId, reason = body.message)
                     }
@@ -173,10 +194,8 @@ class PaymentExternalSystemAdapterImpl(
                         it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                     }
                 }
-
                 else -> {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = e.message)
                     }
@@ -186,11 +205,8 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun price() = properties.price
-
     override fun isEnabled() = properties.enabled
-
     override fun name() = properties.accountName
-
 }
 
 fun now() = System.currentTimeMillis()
