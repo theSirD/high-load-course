@@ -52,4 +52,6 @@ class OrderPayer {
         }
         return createdAt
     }
+
+    fun getTotalRateLimitPerSec() = paymentService.getTotalRateLimitPerSec()
 }
