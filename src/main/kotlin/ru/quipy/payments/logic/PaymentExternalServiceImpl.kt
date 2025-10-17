@@ -114,6 +114,7 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
+    override fun accountRateLimitPerSec() = properties.rateLimitPerSec
 }
 
 fun now() = System.currentTimeMillis()
