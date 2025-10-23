@@ -141,7 +141,7 @@ class PaymentExternalSystemAdapterImpl(
 
             try {
                 if (!rateLimiter.tick()) {
-                    throw RateLimitedException(processingTime.toSeconds())
+                    throw RateLimitedException(now() + processingTime.toMillis())
                 }
 
                 val request = Request.Builder()
