@@ -140,20 +140,20 @@ class PaymentExternalSystemAdapterImpl(
                 val rateLimiterRemainingTime = deadline - now() - processingTime.toMillis() - 200
                 if (rateLimiterRemainingTime <= 0) {
                     logger.warn("[$accountName] Rejecting payment $paymentId: deadline reached while waiting for semaphore")
-                    throw RateLimitedException(processingTime.toMillis())
+                    throw RateLimitedException(processingTime.toSeconds())
                 }
 
                 val nanosToWait = resilience4jRateLimiter.reservePermission()
                 if (nanosToWait < 0) {
                     logger.warn("[$accountName] Rejecting payment $paymentId: rate limit exceeded")
-                    throw RateLimitedException(processingTime.toMillis())
+                    throw RateLimitedException(processingTime.toSeconds())
                 }
 
                 val waitMillis = TimeUnit.NANOSECONDS.toMillis(nanosToWait)
                 if (waitMillis > rateLimiterRemainingTime) {
                     resilience4jRateLimiter.onError(RuntimeException("deadline exceeded"))
                     logger.warn("[$accountName] Rejecting payment $paymentId: rate limit would exceed deadline")
-                    throw RateLimitedException(processingTime.toMillis())
+                    throw RateLimitedException(processingTime.toSeconds())
                 }
 
                 if (waitMillis > 0) Thread.sleep(waitMillis)
