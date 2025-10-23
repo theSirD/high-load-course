@@ -11,6 +11,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.core.EventSourcingService
 import java.net.SocketTimeoutException
@@ -43,7 +44,10 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    private val resilience4jRateLimiter: RateLimiter
+    private val rateLimiter = SlidingWindowRateLimiter(
+        rate = rateLimitPerSec.toLong(),
+        window = Duration.ofSeconds(1)
+    )
     private val semaphore = Semaphore(parallelRequests, true)
 
     private val meterRegistry: MeterRegistry = Metrics.globalRegistry
@@ -58,7 +62,6 @@ class PaymentExternalSystemAdapterImpl(
             .timeoutDuration(Duration.ZERO) // не блокируем acquirePermission
             .build()
 
-        resilience4jRateLimiter = RateLimiter.of("rateLimiter-$accountName", rateLimiterConfig)
 
         semaphoreRequestsCounter = Counter.builder("payment.semaphore.requests.total")
             .description("Total number of requests to the semaphore")
@@ -137,26 +140,9 @@ class PaymentExternalSystemAdapterImpl(
             semaphoreAcquiredCounter.increment()
 
             try {
-                val rateLimiterRemainingTime = deadline - now() - processingTime.toMillis() - 200
-                if (rateLimiterRemainingTime <= 0) {
-                    logger.warn("[$accountName] Rejecting payment $paymentId: deadline reached while waiting for semaphore")
+                if (!rateLimiter.tick()) {
                     throw RateLimitedException(processingTime.toSeconds())
                 }
-
-                val nanosToWait = resilience4jRateLimiter.reservePermission()
-                if (nanosToWait < 0) {
-                    logger.warn("[$accountName] Rejecting payment $paymentId: rate limit exceeded")
-                    throw RateLimitedException(processingTime.toSeconds())
-                }
-
-                val waitMillis = TimeUnit.NANOSECONDS.toMillis(nanosToWait)
-                if (waitMillis > rateLimiterRemainingTime) {
-                    resilience4jRateLimiter.onError(RuntimeException("deadline exceeded"))
-                    logger.warn("[$accountName] Rejecting payment $paymentId: rate limit would exceed deadline")
-                    throw RateLimitedException(processingTime.toSeconds())
-                }
-
-                if (waitMillis > 0) Thread.sleep(waitMillis)
 
                 val request = Request.Builder()
                     .url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
