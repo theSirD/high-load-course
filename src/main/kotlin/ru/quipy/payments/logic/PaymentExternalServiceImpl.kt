@@ -19,6 +19,9 @@ import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
+class RateLimitedException(val retryAfter: Long)
+    : Exception("Rate limited, retry after $retryAfter seconds.")
+
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -137,29 +140,20 @@ class PaymentExternalSystemAdapterImpl(
                 val rateLimiterRemainingTime = deadline - now() - processingTime.toMillis() - 200
                 if (rateLimiterRemainingTime <= 0) {
                     logger.warn("[$accountName] Rejecting payment $paymentId: deadline reached while waiting for semaphore")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Deadline reached while waiting for semaphore")
-                    }
-                    return
+                    throw RateLimitedException(processingTime.toMillis())
                 }
 
                 val nanosToWait = resilience4jRateLimiter.reservePermission()
                 if (nanosToWait < 0) {
                     logger.warn("[$accountName] Rejecting payment $paymentId: rate limit exceeded")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Rate limit exceeded")
-                    }
-                    return
+                    throw RateLimitedException(processingTime.toMillis())
                 }
 
                 val waitMillis = TimeUnit.NANOSECONDS.toMillis(nanosToWait)
                 if (waitMillis > rateLimiterRemainingTime) {
                     resilience4jRateLimiter.onError(RuntimeException("deadline exceeded"))
                     logger.warn("[$accountName] Rejecting payment $paymentId: rate limit would exceed deadline")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Rate limit would exceed deadline")
-                    }
-                    return
+                    throw RateLimitedException(processingTime.toMillis())
                 }
 
                 if (waitMillis > 0) Thread.sleep(waitMillis)
