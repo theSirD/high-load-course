@@ -38,7 +38,7 @@ class OrderPayer {
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
+        val future = paymentExecutor.submit {
             val createdEvent = paymentESService.create {
                 it.create(
                     paymentId,
@@ -50,6 +50,15 @@ class OrderPayer {
 
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
+
+        try {
+            future.get()
+        } catch (e: Exception) {
+            e.cause?.let {
+                throw it
+            }
+        }
+
         return createdAt
     }
 }
