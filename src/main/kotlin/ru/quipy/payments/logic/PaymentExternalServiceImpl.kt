@@ -19,6 +19,7 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import kotlin.math.min
 
 class RateLimitedException(val retryAfter: Long)
     : Exception("Rate limited, retry after $retryAfter seconds.")
@@ -56,13 +57,6 @@ class PaymentExternalSystemAdapterImpl(
     private val semaphoreTimeoutCounter: Counter
 
     init {
-        val rateLimiterConfig = RateLimiterConfig.custom()
-            .limitForPeriod(rateLimitPerSec)
-            .limitRefreshPeriod(Duration.ofSeconds(1))
-            .timeoutDuration(Duration.ZERO) // не блокируем acquirePermission
-            .build()
-
-
         semaphoreRequestsCounter = Counter.builder("payment.semaphore.requests.total")
             .description("Total number of requests to the semaphore")
             .tag("account", accountName)
@@ -117,6 +111,11 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         val remainingTime = deadline - now()
 
+        val plainRateLimit = rateLimitPerSec.toLong()
+        val inflightRequestRateLimit = parallelRequests * 1000 / processingTime.toMillis()
+        val realRateLimit = min(plainRateLimit, inflightRequestRateLimit)
+        val estimatedTimeWaiting = parallelRequests / realRateLimit * 1000
+
         if (remainingTime <= 0) {
             logger.warn("[$accountName] Rejecting payment $paymentId: deadline already passed")
             paymentESService.update(paymentId) {
@@ -127,60 +126,42 @@ class PaymentExternalSystemAdapterImpl(
 
         semaphoreRequestsCounter.increment()
 
+        if (!semaphore.tryAcquire(remainingTime, TimeUnit.MILLISECONDS)) {
+            logger.warn("[$accountName] Rejecting payment $paymentId: parallel requests limit reached")
+            semaphoreTimeoutCounter.increment()
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Parallel requests limit reached")
+            }
+            return
+        }
+
+        semaphoreAcquiredCounter.increment()
+
         try {
-            if (!semaphore.tryAcquire(remainingTime, TimeUnit.MILLISECONDS)) {
-                logger.warn("[$accountName] Rejecting payment $paymentId: parallel requests limit reached")
-                semaphoreTimeoutCounter.increment()
+            if (!rateLimiter.tick()) {
+                throw RateLimitedException(estimatedTimeWaiting)
+            }
+
+            val request = Request.Builder()
+                .url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                .post(emptyBody)
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                val body = try {
+                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                } catch (e: Exception) {
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                }
+
+                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
                 paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Parallel requests limit reached")
-                }
-                return
-            }
-
-            semaphoreAcquiredCounter.increment()
-
-            try {
-                if (!rateLimiter.tick()) {
-                    throw RateLimitedException(now() + processingTime.toMillis())
-                }
-
-                val request = Request.Builder()
-                    .url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                    .post(emptyBody)
-                    .build()
-
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
-
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
-                }
-            } finally {
-                semaphore.release()
-            }
-
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                }
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
                 }
             }
+        } finally {
+            semaphore.release()
         }
     }
 
