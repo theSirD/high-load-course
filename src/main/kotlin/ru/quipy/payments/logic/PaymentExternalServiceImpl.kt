@@ -2,8 +2,6 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import io.github.resilience4j.ratelimiter.RateLimiter
-import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Metrics
@@ -12,14 +10,14 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
-import ru.quipy.payments.api.PaymentAggregate
 import ru.quipy.core.EventSourcingService
-import java.net.SocketTimeoutException
+import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
-import kotlin.math.min
+
+const val retryMills = 700L
 
 class RateLimitedException(val retryAfter: Long)
     : Exception("Rate limited, retry after $retryAfter seconds.")
@@ -111,11 +109,6 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         val remainingTime = deadline - now()
 
-        val plainRateLimit = rateLimitPerSec.toLong()
-        val inflightRequestRateLimit = parallelRequests * 1000 / processingTime.toMillis()
-        val realRateLimit = min(plainRateLimit, inflightRequestRateLimit)
-        val estimatedTimeWaiting = parallelRequests / realRateLimit * 1000
-
         if (remainingTime <= 0) {
             logger.warn("[$accountName] Rejecting payment $paymentId: deadline already passed")
             paymentESService.update(paymentId) {
@@ -139,7 +132,7 @@ class PaymentExternalSystemAdapterImpl(
 
         try {
             if (!rateLimiter.tick()) {
-                throw RateLimitedException(estimatedTimeWaiting)
+                throw RateLimitedException(retryMills)
             }
 
             val request = Request.Builder()

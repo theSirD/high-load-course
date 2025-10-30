@@ -9,7 +9,12 @@ import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import ru.quipy.payments.logic.RateLimitedException
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.*
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Instant
 
 @RestController
 class APIController {
@@ -69,11 +74,13 @@ class APIController {
             val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
             return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
         } catch (e: RateLimitedException) {
-            logger.error("retrying after ${e.retryAfter} seconds...")
+            logger.error("retrying after ${e.retryAfter} milliseconds...")
+
+        val retryMills = System.currentTimeMillis() + e.retryAfter
 
         return ResponseEntity
                 .status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "${e.retryAfter}")
+                .header("Retry-After", "$retryMills")
                 .build()
         }
     }
