@@ -10,6 +10,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
@@ -40,12 +41,15 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
     private val processingTime = properties.averageProcessingTime
+    private val bucketCap = rateLimitPerSec * 1.2
 
     private val client = OkHttpClient.Builder().build()
 
-    private val rateLimiter = SlidingWindowRateLimiter(
-        rate = rateLimitPerSec.toLong(),
-        window = Duration.ofSeconds(1)
+    private val rateLimiter = TokenBucketRateLimiter(
+        rate = rateLimitPerSec,
+        bucketMaxCapacity = bucketCap.toInt(),
+        window = 1,
+        timeUnit = TimeUnit.SECONDS
     )
     private val semaphore = Semaphore(parallelRequests, true)
 
