@@ -20,10 +20,6 @@ class PaymentSystemImpl(
         }
     }
 
-    override fun approximateWaitingTime(queueLength: Long): Long {
-        return paymentAccounts.maxOf { it.approximateWaitingTime(queueLength) }
-    }
-
     override fun getLeakingBucket(waitingTime: Duration): LeakingBucketRateLimiter {
         val bucketSize = paymentAccounts.sumOf {
             it.getRateLimit() * (waitingTime.toMillis() - (it.getProcessingTime().toMillis() * 2)) / 1000
