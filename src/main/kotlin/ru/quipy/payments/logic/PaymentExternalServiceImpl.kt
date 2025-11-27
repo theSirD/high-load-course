@@ -45,10 +45,15 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val processingTime = properties.averageProcessingTime
 
+    private val rateLimiter = SlidingWindowRateLimiter(
+        rate = rateLimitPerSec.toLong(),
+        window = Duration.ofSeconds(1)
+    )
+
     private val client = OkHttpClient.Builder()
         .callTimeout(30, TimeUnit.SECONDS)
         .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(35, TimeUnit.SECONDS)
         .writeTimeout(5, TimeUnit.SECONDS)
         .dispatcher(Dispatcher().apply {
             maxRequests = 1500
@@ -69,10 +74,20 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
+        // Проверка дедлайна перед отправкой запроса
         if (now() + processingTime.toMillis() > deadline) {
             logger.error("[$accountName] too late for this payment $paymentId")
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "deadline exceeded")
+            }
+            return
+        }
+
+        // Неблокирующий rate limit check
+        if (!rateLimiter.tick()) {
+            logger.warn("[$accountName] Rate limit exceeded for payment $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "rate limit exceeded")
             }
             return
         }
