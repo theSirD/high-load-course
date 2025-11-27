@@ -33,9 +33,9 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
 
-    // Rate limiter: контроль rps (1100 rps гарантирует макс 11000 одновременных при 10 сек ответа)
+    // Rate limiter: контроль rps с запасом 100 rps для компенсации burst'ов
     // FixedWindowRateLimiter использует Semaphore — эффективное блокирование без busy-waiting
-    private val rateLimiter = FixedWindowRateLimiter(rateLimitPerSec, 1, TimeUnit.SECONDS)
+    private val rateLimiter = FixedWindowRateLimiter(rateLimitPerSec - 100, 1, TimeUnit.SECONDS)
 
     // Executor для обработки ответов (небольшой фиксированный пул)
     private val responseExecutor = Executors.newFixedThreadPool(32)
