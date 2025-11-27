@@ -6,16 +6,21 @@ import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Tags
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.ConnectionPool
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okhttp3.Response
+import java.io.IOException
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
 
@@ -41,113 +46,105 @@ class PaymentExternalSystemAdapterImpl(
     private val processingTime = properties.averageProcessingTime
 
     private val client = OkHttpClient.Builder()
-        .callTimeout(4, TimeUnit.SECONDS)
+        .callTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
+        .dispatcher(Dispatcher().apply {
+            maxRequests = 1500
+            maxRequestsPerHost = 1500
+        })
+        .connectionPool(ConnectionPool(
+            maxIdleConnections = 200,
+            keepAliveDuration = 5,
+            timeUnit = TimeUnit.MINUTES
+        ))
         .build()
-
-    private val rateLimiter = SlidingWindowRateLimiter(
-        rate = rateLimitPerSec.toLong(),
-        window = Duration.ofSeconds(1)
-    )
-
-    private val semaphore = Semaphore(parallelRequests)
 
     // Используем глобальный MeterRegistry
     private val meterRegistry: MeterRegistry = Metrics.globalRegistry
-
-    // Метрики
-    // Инициализация метрик с тегами для лучшей идентификации
-    private val semaphoreRequestsCounter: Counter = Counter.builder("payment.semaphore.requests.total")
-        .description("Total number of requests to the semaphore")
-        .tag("account", accountName)
-        .tag("service", serviceName)
-        .register(meterRegistry)
-    private val semaphoreAcquiredCounter: Counter = Counter.builder("payment.semaphore.acquired.total")
-        .description("Total number of requests that acquired the semaphore")
-        .tag("account", accountName)
-        .tag("service", serviceName)
-        .register(meterRegistry)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.debug("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
 
-        // Увеличиваем счетчик запросов к семафору
-        semaphoreRequestsCounter.increment()
+        if (now() + processingTime.toMillis() > deadline) {
+            logger.error("[$accountName] too late for this payment $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "deadline exceeded")
+            }
+            return
+        }
 
-        try {
-            semaphore.acquire()
+        val request = Request.Builder()
+            .url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+            .post(emptyBody)
+            .build()
 
-            // Увеличиваем счетчик успешных захватов семафора
-            semaphoreAcquiredCounter.increment()
+        val start = now()
 
-            rateLimiter.tickWithPriorityBlocking(deadline)
-
-            val request = Request.Builder()
-                .url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                .post(emptyBody)
-                .build()
-
-            var  currentRetry = 0
-            val maxRetries = 3
-
-            while (currentRetry < maxRetries) {
-                if (now()+processingTime.toMillis() > deadline) {
-                    logger.error("too late for this payment")
-                    break
-                }
-                val start  = now()
-
-                var body: ExternalSysResponse? = null
+        client.newCall(request).enqueue(object : Callback {
+            override fun onResponse(call: Call, response: Response) {
                 try {
-                    client.newCall(request).execute().use { response ->
-                        body = try {
-                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                        } catch (e: Exception) {
-                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                        }
-                    }
-                }   catch (e: Exception) {} finally {
-                    registerRequestTime(Duration.ofMillis(now() - start))
+                    val requestTime = Duration.ofMillis(now() - start)
+                    registerRequestTime(requestTime)
 
+                    var body: ExternalSysResponse? = null
                     var message: String
-                    if (body == null) {
-                        message = "exception cause"
-                        logger.warn("[$accountName] Payment timed out for txId: $transactionId, payment: $paymentId, message: $message with code")
-                    } else {
-                        message = body.message?: "message is null"
-                        logger.info("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message} with code")
+
+                    try {
+                        body = mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        message = body.message ?: "message is null"
+                        logger.info("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}", e)
+                        body = ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        message = "exception cause: ${e.message}"
                     }
+
                     meterRegistry.counter(
-                            "payment.requests.retry.message",
-                            Tags.of(
-                                "account", accountName,
-                                "service", serviceName,
-                                "transactionId", transactionId.toString(),
-                                "message", message
-                            )
-                        ).increment()
+                        "payment.requests.retry.message",
+                        Tags.of(
+                            "account", accountName,
+                            "service", serviceName,
+                            "transactionId", transactionId.toString(),
+                            "message", message
+                        )
+                    ).increment()
 
-                        // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                        // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(body?.result ?: false, now(), transactionId, reason = body?.message)
-                        }
-
-                    if (body?.result ?: false) {
-                        break
+                    // Обновляем состояние оплаты в зависимости от результата
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(body?.result ?: false, now(), transactionId, reason = body?.message)
                     }
-
-                    currentRetry++
+                } finally {
+                    response.close()
                 }
-
             }
 
+            override fun onFailure(call: Call, e: IOException) {
+                val requestTime = Duration.ofMillis(now() - start)
+                registerRequestTime(requestTime)
 
-        } finally {
-            semaphore.release()
-        }
+                val message = "network error: ${e.message}"
+                logger.warn("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId, message: $message", e)
+
+                meterRegistry.counter(
+                    "payment.requests.retry.message",
+                    Tags.of(
+                        "account", accountName,
+                        "service", serviceName,
+                        "transactionId", transactionId.toString(),
+                        "message", message
+                    )
+                ).increment()
+
+                // Обновляем состояние оплаты при ошибке
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = message)
+                }
+            }
+        })
     }
 
     override fun approximateWaitingTime(queueLength: Long): Long {

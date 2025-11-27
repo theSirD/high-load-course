@@ -16,7 +16,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
-val waitingTime = Duration.ofMillis(20000)
+val waitingTime = Duration.ofMillis(50000)
 
 @Service
 class OrderPayer {
