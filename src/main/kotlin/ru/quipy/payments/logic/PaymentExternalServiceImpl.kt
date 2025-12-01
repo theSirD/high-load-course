@@ -56,8 +56,6 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        val waitStartTime = System.nanoTime()
-
         try {
             rateLimiter.acquirePermission()
         } catch (e: io.github.resilience4j.ratelimiter.RequestNotPermitted) {
@@ -68,10 +66,7 @@ class PaymentExternalSystemAdapterImpl(
             }
             return
         }
-        
-        val waitTime = System.nanoTime() - waitStartTime
 
-        // Логируем отправку запроса
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
@@ -86,19 +81,14 @@ class PaymentExternalSystemAdapterImpl(
             .timeout(Duration.ofSeconds(30))
             .build()
 
-        // Метрика реального RPS отправки запросов к внешней системе
-
-        // Настоящий асинхронный вызов с CompletableFuture
         httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
             .whenComplete { response, throwable ->
                 if (throwable != null) {
-                    // Ошибка запроса
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", throwable)
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = throwable.message ?: "Network error")
                     }
                 } else {
-                    // Успешный ответ
                     val bodyString = response.body()
                     val body = try {
                         mapper.readValue(bodyString, ExternalSysResponse::class.java)
