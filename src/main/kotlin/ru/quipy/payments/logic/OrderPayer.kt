@@ -26,8 +26,6 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    // Увеличен пул потоков для обработки входящих запросов.
-    // HTTP вызовы теперь асинхронные, потоки не блокируются на ожидании ответа.
     private val paymentExecutor = ThreadPoolExecutor(
         32,
         32,
