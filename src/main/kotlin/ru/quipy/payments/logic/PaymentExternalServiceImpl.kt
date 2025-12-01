@@ -2,8 +2,10 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.ratelimiter.RateLimiterConfig
+import io.github.resilience4j.ratelimiter.RateLimiterRegistry
+import io.micrometer.core.instrument.Metrics
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.FixedWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.URI
@@ -33,14 +35,17 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
 
-    // Rate limiter: контроль rps с запасом 100 rps для компенсации burst'ов
-    // FixedWindowRateLimiter использует Semaphore — эффективное блокирование без busy-waiting
-    private val rateLimiter = FixedWindowRateLimiter(rateLimitPerSec - 100, 1, TimeUnit.SECONDS)
+    private val rateLimiterConfig = RateLimiterConfig.custom()
+        .limitRefreshPeriod(Duration.ofMillis(10))
+        .limitForPeriod(11)
+        .timeoutDuration(Duration.ofSeconds(30))
+        .build()
 
-    // Executor для обработки ответов (небольшой фиксированный пул)
+    private val rateLimiter = RateLimiterRegistry.of(rateLimiterConfig)
+        .rateLimiter("payment-rate-limiter:$accountName")
+
     private val responseExecutor = Executors.newFixedThreadPool(32)
 
-    // Java HttpClient с настоящей асинхронностью (NIO под капотом)
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(5))
         .executor(responseExecutor)
@@ -51,8 +56,20 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        // Блокирующее ожидание rate limiter (клиент готов ждать 50 сек)
-        rateLimiter.tickBlocking()
+        val waitStartTime = System.nanoTime()
+
+        try {
+            rateLimiter.acquirePermission()
+        } catch (e: io.github.resilience4j.ratelimiter.RequestNotPermitted) {
+            logger.warn("[$accountName] Rate limit timeout for payment $paymentId")
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
+            }
+            return
+        }
+        
+        val waitTime = System.nanoTime() - waitStartTime
 
         // Логируем отправку запроса
         paymentESService.update(paymentId) {
@@ -68,6 +85,8 @@ class PaymentExternalSystemAdapterImpl(
             .POST(HttpRequest.BodyPublishers.noBody())
             .timeout(Duration.ofSeconds(30))
             .build()
+
+        // Метрика реального RPS отправки запросов к внешней системе
 
         // Настоящий асинхронный вызов с CompletableFuture
         httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
