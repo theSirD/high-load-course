@@ -14,6 +14,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Executors
 
 
 // Advice: always treat time as a Duration
@@ -45,8 +46,11 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = RateLimiterRegistry.of(rateLimiterConfig)
         .rateLimiter("payment-rate-limiter:$accountName")
 
+    private val responseExecutor = Executors.newFixedThreadPool(128)
+
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(5))
+        .executor(responseExecutor)
         .build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -87,7 +91,7 @@ class PaymentExternalSystemAdapterImpl(
             .build()
 
         httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-            .whenComplete({ response, throwable ->
+            .whenCompleteAsync({ response, throwable ->
                 val httpDoneAt = System.currentTimeMillis()
                 val httpMs = httpDoneAt - afterLogSubmission
                 if (throwable != null) {
@@ -115,7 +119,7 @@ class PaymentExternalSystemAdapterImpl(
                     logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs logSubmissionMs=$logSubmissionMs httpMs=$httpMs logProcessingMs=$logProcessingMs totalFromStart=$totalFromStart success=${body.result}")
                     logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
                 }
-            })
+            }, responseExecutor)
     }
 
     override fun price() = properties.price
