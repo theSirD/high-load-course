@@ -22,9 +22,9 @@ class OrderPayer {
 
         private const val THREADS = 128
 
-        private const val REAL_TASK_TIME_SEC = 0.9
+        private const val REAL_TASK_TIME_SEC = 0.65
 
-        private const val MIN_PROCESSING_MS = 700L
+        private const val MIN_PROCESSING_MS = 150L
     }
 
     @Autowired
@@ -67,27 +67,27 @@ class OrderPayer {
                         "queueSize=$queueSize remainingTimeMs=$remainingTime estimatedWaitMs=$timeToStartMs"
             )
 
-            paymentESService.create {
-                it.create(paymentId, orderId, amount)
-            }
+            // paymentESService.create {
+            //     it.create(paymentId, orderId, amount)
+            // }
 
             val rejectTime = System.currentTimeMillis()
 
-            paymentESService.update(paymentId) {
-                it.logSubmission(
-                    false,
-                    UUID.randomUUID(),
-                    rejectTime,
-                    Duration.ofMillis(rejectTime - createdAt)
-                )
+            // paymentESService.update(paymentId) {
+            //     it.logSubmission(
+            //         false,
+            //         UUID.randomUUID(),
+            //         rejectTime,
+            //         Duration.ofMillis(rejectTime - createdAt)
+            //     )
 
-                it.logProcessing(
-                    false,
-                    rejectTime,
-                    null,
-                    reason = "Deadline will be missed"
-                )
-            }
+            //     it.logProcessing(
+            //         false,
+            //         rejectTime,
+            //         null,
+            //         reason = "Deadline will be missed"
+            //     )
+            // }
 
             return createdAt
         }
@@ -97,9 +97,9 @@ class OrderPayer {
             val dequeuedAt = System.currentTimeMillis()
             val queueWaitMs = dequeuedAt - createdAt
 
-            val createdEvent = paymentESService.create {
-                it.create(paymentId, orderId, amount)
-            }
+            // val createdEvent = paymentESService.create {
+            //     it.create(paymentId, orderId, amount)
+            // }
 
             val afterCreate = System.currentTimeMillis()
             val createMs = afterCreate - dequeuedAt

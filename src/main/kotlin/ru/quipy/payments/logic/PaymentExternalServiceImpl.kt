@@ -66,18 +66,18 @@ class PaymentExternalSystemAdapterImpl(
             val totalFromStart = t - paymentStartedAt
             logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs totalFromStart=$totalFromStart success=false reason=Rate_limit_timeout")
             logger.warn("[$accountName] Rate limit timeout for payment $paymentId")
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = false, transactionId, t, Duration.ofMillis(t - paymentStartedAt))
-                it.logProcessing(false, t, transactionId, reason = "Rate limit timeout")
-            }
+            // paymentESService.update(paymentId) {
+            //     it.logSubmission(success = false, transactionId, t, Duration.ofMillis(t - paymentStartedAt))
+            //     it.logProcessing(false, t, transactionId, reason = "Rate limit timeout")
+            // }
             return
         }
 
         val afterRateLimit = System.currentTimeMillis()
         val rateLimitMs = afterRateLimit - t0
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, afterRateLimit, Duration.ofMillis(afterRateLimit - paymentStartedAt))
-        }
+        // paymentESService.update(paymentId) {
+        //     it.logSubmission(success = true, transactionId, afterRateLimit, Duration.ofMillis(afterRateLimit - paymentStartedAt))
+        // }
 
         val afterLogSubmission = System.currentTimeMillis()
         val logSubmissionMs = afterLogSubmission - afterRateLimit
@@ -98,9 +98,9 @@ class PaymentExternalSystemAdapterImpl(
                     val totalFromStart = httpDoneAt - paymentStartedAt
                     logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs logSubmissionMs=$logSubmissionMs httpMs=$httpMs totalFromStart=$totalFromStart success=false reason=${throwable.message ?: "Network_error"}")
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", throwable)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, System.currentTimeMillis(), transactionId, reason = throwable.message ?: "Network error")
-                    }
+                    // paymentESService.update(paymentId) {
+                    //     it.logProcessing(false, System.currentTimeMillis(), transactionId, reason = throwable.message ?: "Network error")
+                    // }
                 } else {
                     val bodyString = response.body()
                     val body = try {
@@ -110,9 +110,9 @@ class PaymentExternalSystemAdapterImpl(
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     }
 
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, System.currentTimeMillis(), transactionId, reason = body.message)
-                    }
+                    // paymentESService.update(paymentId) {
+                    //     it.logProcessing(body.result, System.currentTimeMillis(), transactionId, reason = body.message)
+                    // }
                     val afterLogProcessing = System.currentTimeMillis()
                     val logProcessingMs = afterLogProcessing - httpDoneAt
                     val totalFromStart = afterLogProcessing - paymentStartedAt
