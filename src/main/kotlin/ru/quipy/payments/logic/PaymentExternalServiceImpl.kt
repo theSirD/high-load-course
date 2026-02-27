@@ -39,10 +39,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiterConfig = RateLimiterConfig.custom()
         .limitRefreshPeriod(Duration.ofMillis(10))
         .limitForPeriod(maxOf(1, properties.rateLimitPerSec / 100))
-        .timeoutDuration(maxOf(
-            properties.averageProcessingTime.multipliedBy(2),
-            Duration.ofMillis(500)
-        ))
+        .timeoutDuration(Duration.ofMillis(500))
         .build()
 
     private val rateLimiter = RateLimiterRegistry.of(rateLimiterConfig)
@@ -96,11 +93,22 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
+        val remainingForHttp = deadline - System.currentTimeMillis()
+        if (remainingForHttp < 150) {
+            semaphore.release()
+            val t = System.currentTimeMillis()
+            logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId " +
+                "rateLimitMs=$rateLimitMs logSubmissionMs=${t - afterLogSubmission} httpMs=0 " +
+                "totalFromStart=${t - paymentStartedAt} success=false reason=Deadline_too_close")
+            return
+        }
+        val httpTimeoutMs = minOf(5000L, remainingForHttp - 50)
+
         val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
         val request = HttpRequest.newBuilder()
             .uri(URI.create(url))
             .POST(HttpRequest.BodyPublishers.noBody())
-            .timeout(Duration.ofSeconds(5))
+            .timeout(Duration.ofMillis(httpTimeoutMs))
             .build()
 
         httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
@@ -142,5 +150,7 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
+
+    override fun rateLimitPerSec() = properties.rateLimitPerSec
 
 }

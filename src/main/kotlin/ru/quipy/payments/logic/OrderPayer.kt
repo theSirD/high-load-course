@@ -22,7 +22,8 @@ class OrderPayer {
 
         private const val THREADS = 128
 
-        private const val REAL_TASK_TIME_SEC = 0.65
+        /** Fallback when rateLimitPerSec is 0 or unknown (≈33 ms thread hold per task for async submit). */
+        private const val FALLBACK_TASK_TIME_SEC = 0.03
 
         private const val MIN_PROCESSING_MS = 150L
     }
@@ -54,9 +55,13 @@ class OrderPayer {
 
         val queueSize = paymentExecutor.queue.size
 
-        val effectiveRps = THREADS / REAL_TASK_TIME_SEC
-
-        val timeToStartMs = (queueSize / effectiveRps) * 1000
+        val rateLimitPerSec = paymentService.getEffectiveRateLimitPerSec()
+        val effectiveRps = if (rateLimitPerSec > 0) {
+            rateLimitPerSec
+        } else {
+            (THREADS / FALLBACK_TASK_TIME_SEC).toInt()
+        }
+        val timeToStartMs = (queueSize.toDouble() / effectiveRps) * 1000
 
         val remainingTime = deadline - createdAt
 

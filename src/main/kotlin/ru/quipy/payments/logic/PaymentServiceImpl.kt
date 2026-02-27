@@ -26,4 +26,7 @@ class PaymentSystemImpl(
             account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
     }
+
+    override fun getEffectiveRateLimitPerSec(): Int =
+        paymentAccounts.filter { it.isEnabled() }.sumOf { it.rateLimitPerSec() }
 }

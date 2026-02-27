@@ -8,6 +8,12 @@ interface PaymentService {
      * Submit payment request to some external service.
      */
     fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long)
+
+    /**
+     * Effective rate limit (sum of enabled adapters' rateLimitPerSec) for backpressure estimation.
+     * Returns 0 if unknown.
+     */
+    fun getEffectiveRateLimitPerSec(): Int
 }
 
 /**
@@ -24,6 +30,9 @@ interface PaymentExternalSystemAdapter {
     fun price(): Int
 
     fun isEnabled(): Boolean
+
+    /** Rate limit in requests per second for this account. */
+    fun rateLimitPerSec(): Int
 }
 
 /**
