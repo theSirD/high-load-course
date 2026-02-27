@@ -15,6 +15,8 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -47,6 +49,8 @@ class PaymentExternalSystemAdapterImpl(
         .rateLimiter("payment-rate-limiter:$accountName")
 
     private val responseExecutor = Executors.newFixedThreadPool(128)
+
+    private val semaphore = Semaphore(properties.parallelRequests)
 
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(5))
@@ -83,6 +87,15 @@ class PaymentExternalSystemAdapterImpl(
         val logSubmissionMs = afterLogSubmission - afterRateLimit
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
+        val remainingMs = deadline - System.currentTimeMillis()
+        if (remainingMs <= 0 || !semaphore.tryAcquire(remainingMs, TimeUnit.MILLISECONDS)) {
+            val t = System.currentTimeMillis()
+            logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId " +
+                "rateLimitMs=$rateLimitMs logSubmissionMs=0 httpMs=0 totalFromStart=${t - paymentStartedAt} " +
+                "success=false reason=Semaphore_timeout")
+            return
+        }
+
         val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
         val request = HttpRequest.newBuilder()
             .uri(URI.create(url))
@@ -101,6 +114,7 @@ class PaymentExternalSystemAdapterImpl(
                     // paymentESService.update(paymentId) {
                     //     it.logProcessing(false, System.currentTimeMillis(), transactionId, reason = throwable.message ?: "Network error")
                     // }
+                    semaphore.release()
                 } else {
                     val bodyString = response.body()
                     val body = try {
@@ -118,6 +132,7 @@ class PaymentExternalSystemAdapterImpl(
                     val totalFromStart = afterLogProcessing - paymentStartedAt
                     logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs logSubmissionMs=$logSubmissionMs httpMs=$httpMs logProcessingMs=$logProcessingMs totalFromStart=$totalFromStart success=${body.result}")
                     logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                    semaphore.release()
                 }
             }, responseExecutor)
     }
