@@ -24,7 +24,7 @@ class OrderPayer {
 
         private const val REAL_TASK_TIME_SEC = 0.9
 
-        private const val SAFETY_MARGIN_MS = 100
+        private const val MIN_PROCESSING_MS = 700L
     }
 
     @Autowired
@@ -52,17 +52,15 @@ class OrderPayer {
 
         val createdAt = System.currentTimeMillis()
 
-        val now = createdAt------
-
         val queueSize = paymentExecutor.queue.size
 
         val effectiveRps = THREADS / REAL_TASK_TIME_SEC
 
         val timeToStartMs = (queueSize / effectiveRps) * 1000
 
-        val remainingTime = deadline - now
+        val remainingTime = deadline - createdAt
 
-        if (remainingTime < timeToStartMs + SAFETY_MARGIN_MS) {
+        if (remainingTime < timeToStartMs + MIN_PROCESSING_MS) {
 
             logger.warn(
                 "PAYMENT_REJECTED paymentId=$paymentId reason=Deadline_will_be_missed " +
