@@ -8,6 +8,7 @@ import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -18,6 +19,13 @@ class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
+
+        private const val THREADS = 128
+
+        /** Fallback when rateLimitPerSec is 0 or unknown (≈33 ms thread hold per task for async submit). */
+        private const val FALLBACK_TASK_TIME_SEC = 0.03
+
+        private const val MIN_PROCESSING_MS = 150L
     }
 
     @Autowired
@@ -27,8 +35,8 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        32,
-        32,
+        THREADS,
+        THREADS,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(20_000),
@@ -36,20 +44,84 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
-        val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit {
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
-            }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+    fun processPayment(
+        orderId: UUID,
+        amount: Int,
+        paymentId: UUID,
+        deadline: Long
+    ): Long {
 
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+        val createdAt = System.currentTimeMillis()
+
+        val queueSize = paymentExecutor.queue.size
+
+        val rateLimitPerSec = paymentService.getEffectiveRateLimitPerSec()
+        val effectiveRps = if (rateLimitPerSec > 0) {
+            rateLimitPerSec
+        } else {
+            (THREADS / FALLBACK_TASK_TIME_SEC).toInt()
         }
+        val timeToStartMs = (queueSize.toDouble() / effectiveRps) * 1000
+
+        val remainingTime = deadline - createdAt
+
+        if (remainingTime < timeToStartMs + MIN_PROCESSING_MS) {
+
+            logger.warn(
+                "PAYMENT_REJECTED paymentId=$paymentId reason=Deadline_will_be_missed " +
+                        "queueSize=$queueSize remainingTimeMs=$remainingTime estimatedWaitMs=$timeToStartMs"
+            )
+
+            // paymentESService.create {
+            //     it.create(paymentId, orderId, amount)
+            // }
+
+            val rejectTime = System.currentTimeMillis()
+
+            // paymentESService.update(paymentId) {
+            //     it.logSubmission(
+            //         false,
+            //         UUID.randomUUID(),
+            //         rejectTime,
+            //         Duration.ofMillis(rejectTime - createdAt)
+            //     )
+
+            //     it.logProcessing(
+            //         false,
+            //         rejectTime,
+            //         null,
+            //         reason = "Deadline will be missed"
+            //     )
+            // }
+
+            return createdAt
+        }
+
+        paymentExecutor.submit {
+
+            val dequeuedAt = System.currentTimeMillis()
+            val queueWaitMs = dequeuedAt - createdAt
+
+            // val createdEvent = paymentESService.create {
+            //     it.create(paymentId, orderId, amount)
+            // }
+
+            val afterCreate = System.currentTimeMillis()
+            val createMs = afterCreate - dequeuedAt
+
+            logger.info(
+                "PAYMENT_METRICS paymentId=$paymentId orderId=$orderId " +
+                        "queueWaitMs=$queueWaitMs createMs=$createMs"
+            )
+
+            paymentService.submitPaymentRequest(
+                paymentId,
+                amount,
+                createdAt,
+                deadline
+            )
+        }
+
         return createdAt
     }
 }

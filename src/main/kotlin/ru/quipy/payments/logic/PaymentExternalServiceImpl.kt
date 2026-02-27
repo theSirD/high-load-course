@@ -15,6 +15,7 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
 
@@ -37,14 +38,16 @@ class PaymentExternalSystemAdapterImpl(
 
     private val rateLimiterConfig = RateLimiterConfig.custom()
         .limitRefreshPeriod(Duration.ofMillis(10))
-        .limitForPeriod(11)
-        .timeoutDuration(Duration.ofSeconds(30))
+        .limitForPeriod(maxOf(1, properties.rateLimitPerSec / 100))
+        .timeoutDuration(Duration.ofMillis(500))
         .build()
 
     private val rateLimiter = RateLimiterRegistry.of(rateLimiterConfig)
         .rateLimiter("payment-rate-limiter:$accountName")
 
-    private val responseExecutor = Executors.newFixedThreadPool(32)
+    private val responseExecutor = Executors.newFixedThreadPool(128)
+
+    private val semaphore = Semaphore(properties.parallelRequests)
 
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(5))
@@ -52,42 +55,74 @@ class PaymentExternalSystemAdapterImpl(
         .build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val t0 = System.currentTimeMillis()
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
-
         try {
             rateLimiter.acquirePermission()
         } catch (e: io.github.resilience4j.ratelimiter.RequestNotPermitted) {
+            val t = System.currentTimeMillis()
+            val rateLimitMs = t - t0
+            val totalFromStart = t - paymentStartedAt
+            logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs totalFromStart=$totalFromStart success=false reason=Rate_limit_timeout")
             logger.warn("[$accountName] Rate limit timeout for payment $paymentId")
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = false, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-                it.logProcessing(false, now(), transactionId, reason = "Rate limit timeout")
-            }
+            // paymentESService.update(paymentId) {
+            //     it.logSubmission(success = false, transactionId, t, Duration.ofMillis(t - paymentStartedAt))
+            //     it.logProcessing(false, t, transactionId, reason = "Rate limit timeout")
+            // }
             return
         }
 
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-        }
+        val afterRateLimit = System.currentTimeMillis()
+        val rateLimitMs = afterRateLimit - t0
+        // paymentESService.update(paymentId) {
+        //     it.logSubmission(success = true, transactionId, afterRateLimit, Duration.ofMillis(afterRateLimit - paymentStartedAt))
+        // }
 
+        val afterLogSubmission = System.currentTimeMillis()
+        val logSubmissionMs = afterLogSubmission - afterRateLimit
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
+        val remainingMs = deadline - System.currentTimeMillis()
+        if (remainingMs <= 0 || !semaphore.tryAcquire(remainingMs, TimeUnit.MILLISECONDS)) {
+            val t = System.currentTimeMillis()
+            logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId " +
+                "rateLimitMs=$rateLimitMs logSubmissionMs=0 httpMs=0 totalFromStart=${t - paymentStartedAt} " +
+                "success=false reason=Semaphore_timeout")
+            return
+        }
+
+        val remainingForHttp = deadline - System.currentTimeMillis()
+        if (remainingForHttp < 150) {
+            semaphore.release()
+            val t = System.currentTimeMillis()
+            logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId " +
+                "rateLimitMs=$rateLimitMs logSubmissionMs=${t - afterLogSubmission} httpMs=0 " +
+                "totalFromStart=${t - paymentStartedAt} success=false reason=Deadline_too_close")
+            return
+        }
+        val httpTimeoutMs = minOf(5000L, remainingForHttp - 50)
+
         val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
-        
         val request = HttpRequest.newBuilder()
             .uri(URI.create(url))
             .POST(HttpRequest.BodyPublishers.noBody())
-            .timeout(Duration.ofSeconds(30))
+            .timeout(Duration.ofMillis(httpTimeoutMs))
             .build()
 
         httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-            .whenComplete { response, throwable ->
+            .whenCompleteAsync({ response, throwable ->
+                val httpDoneAt = System.currentTimeMillis()
+                val httpMs = httpDoneAt - afterLogSubmission
                 if (throwable != null) {
+                    val totalFromStart = httpDoneAt - paymentStartedAt
+                    logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs logSubmissionMs=$logSubmissionMs httpMs=$httpMs totalFromStart=$totalFromStart success=false reason=${throwable.message ?: "Network_error"}")
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", throwable)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = throwable.message ?: "Network error")
-                    }
+                    // paymentESService.update(paymentId) {
+                    //     it.logProcessing(false, System.currentTimeMillis(), transactionId, reason = throwable.message ?: "Network error")
+                    // }
+                    semaphore.release()
                 } else {
                     val bodyString = response.body()
                     val body = try {
@@ -97,13 +132,17 @@ class PaymentExternalSystemAdapterImpl(
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     }
 
+                    // paymentESService.update(paymentId) {
+                    //     it.logProcessing(body.result, System.currentTimeMillis(), transactionId, reason = body.message)
+                    // }
+                    val afterLogProcessing = System.currentTimeMillis()
+                    val logProcessingMs = afterLogProcessing - httpDoneAt
+                    val totalFromStart = afterLogProcessing - paymentStartedAt
+                    logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs logSubmissionMs=$logSubmissionMs httpMs=$httpMs logProcessingMs=$logProcessingMs totalFromStart=$totalFromStart success=${body.result}")
                     logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
+                    semaphore.release()
                 }
-            }
+            }, responseExecutor)
     }
 
     override fun price() = properties.price
@@ -112,6 +151,6 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
-}
+    override fun rateLimitPerSec() = properties.rateLimitPerSec
 
-public fun now() = System.currentTimeMillis()
+}
