@@ -19,6 +19,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 
 // Advice: always treat time as a Duration
@@ -90,6 +91,14 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         val remainingMs = deadline - System.currentTimeMillis()
+        val minRequiredForHttpMs = maxOf(150L, properties.averageProcessingTime.toMillis() / 2)
+        if (remainingMs < minRequiredForHttpMs) {
+            val t = System.currentTimeMillis()
+            logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId " +
+                "rateLimitMs=$rateLimitMs logSubmissionMs=0 httpMs=0 totalFromStart=${t - paymentStartedAt} " +
+                "success=false reason=Deadline_too_short_for_http")
+            return
+        }
         if (remainingMs <= 0 || !semaphore.tryAcquire(remainingMs, TimeUnit.MILLISECONDS)) {
             val t = System.currentTimeMillis()
             logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId " +
@@ -107,7 +116,7 @@ class PaymentExternalSystemAdapterImpl(
                 "totalFromStart=${t - paymentStartedAt} success=false reason=Deadline_too_close")
             return
         }
-        val httpTimeoutMs = minOf(5000L, remainingForHttp - 50)
+        val httpTimeoutMs = minOf(5000L, remainingForHttp - 5)
 
         val url = "http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount"
         val request = HttpRequest.newBuilder()
@@ -116,6 +125,8 @@ class PaymentExternalSystemAdapterImpl(
             .timeout(Duration.ofMillis(httpTimeoutMs))
             .build()
 
+        val future1Failed = AtomicBoolean(false)
+        val hedgeActive = AtomicBoolean(false)
         val result = CompletableFuture<HttpResponse<String>>()
         result.whenCompleteAsync({ response, throwable ->
             val httpDoneAt = System.currentTimeMillis()
@@ -145,16 +156,25 @@ class PaymentExternalSystemAdapterImpl(
         val future1 = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
         future1.whenCompleteAsync({ r, t ->
             if (!result.isDone) {
-                if (t != null) result.completeExceptionally(t) else r?.let { result.complete(it) }
+                if (t != null) {
+                    if (!hedgeActive.get()) {
+                        result.completeExceptionally(t)
+                    } else {
+                        future1Failed.set(true)
+                    }
+                } else {
+                    r?.let { result.complete(it) }
+                }
             }
         }, responseExecutor)
 
         if (remainingForHttp > HEDGE_THRESHOLD_MS) {
+            hedgeActive.set(true)
             hedgeScheduler.schedule({
-                if (future1.isDone) return@schedule
+                if (future1.isDone && !future1Failed.get()) return@schedule
                 val remainingForHttp2 = deadline - System.currentTimeMillis()
                 if (remainingForHttp2 < 150) return@schedule
-                val httpTimeoutMs2 = minOf(5000L, remainingForHttp2 - 50)
+                val httpTimeoutMs2 = minOf(5000L, remainingForHttp2 - 5)
                 val request2 = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .POST(HttpRequest.BodyPublishers.noBody())
@@ -163,7 +183,11 @@ class PaymentExternalSystemAdapterImpl(
                 val future2 = httpClient.sendAsync(request2, HttpResponse.BodyHandlers.ofString())
                 future2.whenCompleteAsync({ r, t ->
                     if (!result.isDone) {
-                        if (t != null) result.completeExceptionally(t) else r?.let { result.complete(it) }
+                        if (t != null) {
+                            if (future1Failed.get()) result.completeExceptionally(t)
+                        } else {
+                            r?.let { result.complete(it) }
+                        }
                     }
                 }, responseExecutor)
             }, HEDGE_THRESHOLD_MS, TimeUnit.MILLISECONDS)
