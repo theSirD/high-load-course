@@ -33,7 +33,7 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper = ObjectMapper().registerKotlinModule()
-        private const val HEDGE_THRESHOLD_MS = 800L
+        private const val HEDGE_THRESHOLD_MS = 400L
     }
 
     private val serviceName = properties.serviceName
@@ -173,7 +173,12 @@ class PaymentExternalSystemAdapterImpl(
             hedgeScheduler.schedule({
                 if (future1.isDone && !future1Failed.get()) return@schedule
                 val remainingForHttp2 = deadline - System.currentTimeMillis()
-                if (remainingForHttp2 < 150) return@schedule
+                if (remainingForHttp2 < 150) {
+                    if (!result.isDone && future1Failed.get()) {
+                        result.completeExceptionally(Exception("Hedge deadline too close, future1 already failed"))
+                    }
+                    return@schedule
+                }
                 val httpTimeoutMs2 = minOf(5000L, remainingForHttp2 - 5)
                 val request2 = HttpRequest.newBuilder()
                     .uri(URI.create(url))
