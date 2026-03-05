@@ -33,7 +33,7 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper = ObjectMapper().registerKotlinModule()
-        private const val HEDGE_DELAY_STAGGER_MS = 50L
+        private const val HEDGE_DELAY_STAGGER_MS = 5L
         private const val MIN_REMAINING_FOR_HEDGE_MS = 150L
     }
 
@@ -93,7 +93,13 @@ class PaymentExternalSystemAdapterImpl(
 
         val remainingMs = deadline - System.currentTimeMillis()
         val deadlineWindowMs = deadline - paymentStartedAt
-        val hedgeCount = if (properties.averageProcessingTime.toMillis() >= deadlineWindowMs * 0.9) 4 else 1
+        val hedgeCount = if (properties.averageProcessingTime.toMillis() >= deadlineWindowMs * 0.9) {
+            when {
+                remainingMs >= (deadlineWindowMs * 0.90).toLong() -> 4
+                remainingMs >= (deadlineWindowMs * 0.70).toLong() -> 6
+                else -> 8
+            }
+        } else 1
         val permits = hedgeCount
 
         val minRequiredForHttpMs = maxOf(150L, properties.averageProcessingTime.toMillis() / 2)
