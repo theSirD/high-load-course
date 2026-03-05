@@ -14,7 +14,9 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
@@ -30,6 +32,7 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper = ObjectMapper().registerKotlinModule()
+        private const val HEDGE_THRESHOLD_MS = 800L
     }
 
     private val serviceName = properties.serviceName
@@ -46,6 +49,8 @@ class PaymentExternalSystemAdapterImpl(
         .rateLimiter("payment-rate-limiter:$accountName")
 
     private val responseExecutor = Executors.newFixedThreadPool(128)
+
+    private val hedgeScheduler: ScheduledExecutorService = Executors.newScheduledThreadPool(2)
 
     private val semaphore = Semaphore(properties.parallelRequests)
 
@@ -111,38 +116,58 @@ class PaymentExternalSystemAdapterImpl(
             .timeout(Duration.ofMillis(httpTimeoutMs))
             .build()
 
-        httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-            .whenCompleteAsync({ response, throwable ->
-                val httpDoneAt = System.currentTimeMillis()
-                val httpMs = httpDoneAt - afterLogSubmission
-                if (throwable != null) {
-                    val totalFromStart = httpDoneAt - paymentStartedAt
-                    logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs logSubmissionMs=$logSubmissionMs httpMs=$httpMs totalFromStart=$totalFromStart success=false reason=${throwable.message ?: "Network_error"}")
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", throwable)
-                    // paymentESService.update(paymentId) {
-                    //     it.logProcessing(false, System.currentTimeMillis(), transactionId, reason = throwable.message ?: "Network error")
-                    // }
-                    semaphore.release()
-                } else {
-                    val bodyString = response.body()
-                    val body = try {
-                        mapper.readValue(bodyString, ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: $bodyString")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
-
-                    // paymentESService.update(paymentId) {
-                    //     it.logProcessing(body.result, System.currentTimeMillis(), transactionId, reason = body.message)
-                    // }
-                    val afterLogProcessing = System.currentTimeMillis()
-                    val logProcessingMs = afterLogProcessing - httpDoneAt
-                    val totalFromStart = afterLogProcessing - paymentStartedAt
-                    logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs logSubmissionMs=$logSubmissionMs httpMs=$httpMs logProcessingMs=$logProcessingMs totalFromStart=$totalFromStart success=${body.result}")
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-                    semaphore.release()
+        val result = CompletableFuture<HttpResponse<String>>()
+        result.whenCompleteAsync({ response, throwable ->
+            val httpDoneAt = System.currentTimeMillis()
+            val httpMs = httpDoneAt - afterLogSubmission
+            if (throwable != null) {
+                val totalFromStart = httpDoneAt - paymentStartedAt
+                logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs logSubmissionMs=$logSubmissionMs httpMs=$httpMs totalFromStart=$totalFromStart success=false reason=${throwable.message ?: "Network_error"}")
+                logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", throwable)
+                semaphore.release()
+            } else {
+                val bodyString = response!!.body()
+                val body = try {
+                    mapper.readValue(bodyString, ExternalSysResponse::class.java)
+                } catch (e: Exception) {
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.statusCode()}, reason: $bodyString")
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                 }
-            }, responseExecutor)
+                val afterLogProcessing = System.currentTimeMillis()
+                val logProcessingMs = afterLogProcessing - httpDoneAt
+                val totalFromStart = afterLogProcessing - paymentStartedAt
+                logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs logSubmissionMs=$logSubmissionMs httpMs=$httpMs logProcessingMs=$logProcessingMs totalFromStart=$totalFromStart success=${body.result}")
+                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                semaphore.release()
+            }
+        }, responseExecutor)
+
+        val future1 = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+        future1.whenCompleteAsync({ r, t ->
+            if (!result.isDone) {
+                if (t != null) result.completeExceptionally(t) else r?.let { result.complete(it) }
+            }
+        }, responseExecutor)
+
+        if (remainingForHttp > HEDGE_THRESHOLD_MS) {
+            hedgeScheduler.schedule({
+                if (future1.isDone) return@schedule
+                val remainingForHttp2 = deadline - System.currentTimeMillis()
+                if (remainingForHttp2 < 150) return@schedule
+                val httpTimeoutMs2 = minOf(5000L, remainingForHttp2 - 50)
+                val request2 = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .POST(HttpRequest.BodyPublishers.noBody())
+                    .timeout(Duration.ofMillis(httpTimeoutMs2))
+                    .build()
+                val future2 = httpClient.sendAsync(request2, HttpResponse.BodyHandlers.ofString())
+                future2.whenCompleteAsync({ r, t ->
+                    if (!result.isDone) {
+                        if (t != null) result.completeExceptionally(t) else r?.let { result.complete(it) }
+                    }
+                }, responseExecutor)
+            }, HEDGE_THRESHOLD_MS, TimeUnit.MILLISECONDS)
+        }
     }
 
     override fun price() = properties.price
