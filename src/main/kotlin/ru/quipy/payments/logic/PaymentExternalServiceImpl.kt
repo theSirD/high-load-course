@@ -74,18 +74,18 @@ class PaymentExternalSystemAdapterImpl(
             val totalFromStart = t - paymentStartedAt
             logger.info("PAYMENT_METRICS paymentId=$paymentId transactionId=$transactionId rateLimitMs=$rateLimitMs totalFromStart=$totalFromStart success=false reason=Rate_limit_timeout")
             logger.warn("[$accountName] Rate limit timeout for payment $paymentId")
-            // paymentESService.update(paymentId) {
-            //     it.logSubmission(success = false, transactionId, t, Duration.ofMillis(t - paymentStartedAt))
-            //     it.logProcessing(false, t, transactionId, reason = "Rate limit timeout")
-            // }
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = false, transactionId, t, Duration.ofMillis(t - paymentStartedAt))
+                it.logProcessing(false, t, transactionId, reason = "Rate limit timeout")
+            }
             return
         }
 
         val afterRateLimit = System.currentTimeMillis()
         val rateLimitMs = afterRateLimit - t0
-        // paymentESService.update(paymentId) {
-        //     it.logSubmission(success = true, transactionId, afterRateLimit, Duration.ofMillis(afterRateLimit - paymentStartedAt))
-        // }
+        paymentESService.update(paymentId) {
+            it.logSubmission(success = true, transactionId, afterRateLimit, Duration.ofMillis(afterRateLimit - paymentStartedAt))
+        }
 
         val afterLogSubmission = System.currentTimeMillis()
         val logSubmissionMs = afterLogSubmission - afterRateLimit
