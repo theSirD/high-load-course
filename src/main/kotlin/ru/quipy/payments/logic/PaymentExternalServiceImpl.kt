@@ -2,9 +2,11 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import io.github.resilience4j.ratelimiter.RateLimiterConfig
 import io.github.resilience4j.ratelimiter.RateLimiterRegistry
-import io.micrometer.core.instrument.Metrics
 import org.slf4j.LoggerFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -15,6 +17,7 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CompletionStage
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.Semaphore
@@ -55,6 +58,17 @@ class PaymentExternalSystemAdapterImpl(
     private val hedgeScheduler: ScheduledExecutorService = Executors.newScheduledThreadPool(2)
 
     private val semaphore = Semaphore(properties.parallelRequests)
+
+    private val config = CircuitBreakerConfig.custom()
+        .failureRateThreshold(50f)
+        .waitDurationInOpenState(Duration.ofSeconds(30))
+        .permittedNumberOfCallsInHalfOpenState(4)
+        .minimumNumberOfCalls(20)
+        .slidingWindowSize(100)
+        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+        .build()
+
+    val circuitBreaker: CircuitBreaker = CircuitBreaker.of("payment-service", config)
 
     private val httpClient: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(5))
@@ -163,15 +177,27 @@ class PaymentExternalSystemAdapterImpl(
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .timeout(Duration.ofMillis(httpTimeoutMs))
                 .build()
-            val future = httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-            future.whenCompleteAsync({ r, t ->
+            val decorated = CircuitBreaker.decorateCompletionStage(circuitBreaker) {
+                httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+            }
+
+            val protectedStage: CompletionStage<HttpResponse<String>> = decorated.get()
+
+            protectedStage.whenCompleteAsync({ r, t ->
                 if (result.isDone) return@whenCompleteAsync
+
                 if (t != null) {
-                    if (failuresRemaining.decrementAndGet() == 0) {
+                    if (t is CallNotPermittedException) {
+                        logger.warn("[$accountName] Circuit OPEN → txId=$txId payment=$paymentId skipped")
+                    } else {
+                        logger.debug("[$accountName] Network/timeout error txId=$txId", t)
+                    }
+
+                    if (failuresRemaining.decrementAndGet() == 0 && !result.isDone) {
                         result.completeExceptionally(t)
                     }
                 } else {
-                    r?.let { result.complete(it) }
+                    result.complete(r)
                 }
             }, responseExecutor)
         }
